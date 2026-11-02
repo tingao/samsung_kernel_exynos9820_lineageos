@@ -582,6 +582,9 @@ nla_put_failure:
 }
 
 static const struct nla_policy sctp_nla_policy[CTA_PROTOINFO_SCTP_MAX+1] = {
+	/* 4.14 has no NLA_POLICY_MAX(); the CTA_PROTOINFO_SCTP_STATE range
+	 * (<= last valid enum value) is validated in nlattr_to_sctp().
+	 */
 	[CTA_PROTOINFO_SCTP_STATE]	    = { .type = NLA_U8 },
 	[CTA_PROTOINFO_SCTP_VTAG_ORIGINAL]  = { .type = NLA_U32 },
 	[CTA_PROTOINFO_SCTP_VTAG_REPLY]     = { .type = NLA_U32 },
@@ -605,6 +608,13 @@ static int nlattr_to_sctp(struct nlattr *cda[], struct nf_conn *ct)
 	if (!tb[CTA_PROTOINFO_SCTP_STATE] ||
 	    !tb[CTA_PROTOINFO_SCTP_VTAG_ORIGINAL] ||
 	    !tb[CTA_PROTOINFO_SCTP_VTAG_REPLY])
+		return -EINVAL;
+
+	/* Reject states past the last valid enum member (this is what
+	 * NLA_POLICY_MAX(NLA_U8, SCTP_CONNTRACK_MAX - 1) enforces upstream);
+	 * otherwise ct->proto.sctp.state can index past the state tables.
+	 */
+	if (nla_get_u8(tb[CTA_PROTOINFO_SCTP_STATE]) >= SCTP_CONNTRACK_MAX)
 		return -EINVAL;
 
 	spin_lock_bh(&ct->lock);
