@@ -182,6 +182,13 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
 					   func(). */
 					if (curr->func(skb, off) == false)
 						return false;
+					/*
+					 * ipv6_hop_jumbo() calls
+					 * pskb_trim_rcsum(), which can change
+					 * skb pointers: refresh nh.
+					 */
+					if (curr->type == IPV6_TLV_JUMBO)
+						nh = skb_network_header(skb);
 					break;
 				}
 			}
