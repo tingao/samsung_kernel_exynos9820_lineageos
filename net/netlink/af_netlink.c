@@ -764,6 +764,19 @@ static int netlink_release(struct socket *sock)
 				NETLINK_URELEASE, &n);
 	}
 
+	/* Terminate any outstanding dump before dropping the module reference,
+	 * so a dump callback cannot run after the module is unloaded.  The socket
+	 * destructor keeps its own fallback for teardown paths that do not go
+	 * through here; clearing cb_running makes sure the dump is finalised once.
+	 */
+	if (nlk->cb_running) {
+		if (nlk->cb.done)
+			nlk->cb.done(&nlk->cb);
+		module_put(nlk->cb.module);
+		kfree_skb(nlk->cb.skb);
+		nlk->cb_running = false;
+	}
+
 	module_put(nlk->module);
 
 	if (netlink_is_kernel(sk)) {
