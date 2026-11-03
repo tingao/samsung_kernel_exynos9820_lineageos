@@ -67,6 +67,7 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 	struct in6_addr *nexthop;
 	int ret;
 
+	rcu_read_lock();
 	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr)) {
 		struct inet6_dev *idev = ip6_dst_idev(skb_dst(skb));
 
@@ -90,6 +91,7 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 					      IPSTATS_MIB_OUTDISCARDS);
 				DROPDUMP_QUEUE_SKB(skb, NET_DROPDUMP_IPSTATS_MIB_OUTDISCARDS2);
 				kfree_skb(skb);
+				rcu_read_unlock();
 				return 0;
 			}
 		}
@@ -100,6 +102,7 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 		    IPV6_ADDR_SCOPE_NODELOCAL &&
 		    !(dev->flags & IFF_LOOPBACK)) {
 			kfree_skb(skb);
+			rcu_read_unlock();
 			return 0;
 		}
 	}
@@ -107,11 +110,12 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 	if (lwtunnel_xmit_redirect(dst->lwtstate)) {
 		int res = lwtunnel_xmit(skb);
 
-		if (res != LWTUNNEL_XMIT_CONTINUE)
+		if (res != LWTUNNEL_XMIT_CONTINUE) {
+			rcu_read_unlock();
 			return res;
+		}
 	}
 
-	rcu_read_lock_bh();
 	nexthop = rt6_nexthop((struct rt6_info *)dst, &ipv6_hdr(skb)->daddr);
 	neigh = __ipv6_neigh_lookup_noref(dst->dev, nexthop);
 	if (unlikely(!neigh))
@@ -119,10 +123,10 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 	if (!IS_ERR(neigh)) {
 		sock_confirm_neigh(skb, neigh);
 		ret = neigh_output(neigh, skb);
-		rcu_read_unlock_bh();
+		rcu_read_unlock();
 		return ret;
 	}
-	rcu_read_unlock_bh();
+	rcu_read_unlock();
 
 	IP6_INC_STATS(net, ip6_dst_idev(dst), IPSTATS_MIB_OUTNOROUTES);
 	DROPDUMP_QUEUE_SKB(skb, NET_DROPDUMP_IPSTATS_MIB_OUTNOROUTES);
@@ -202,23 +206,32 @@ static int ip6_finish_output(struct net *net, struct sock *sk, struct sk_buff *s
 
 int ip6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
-	struct net_device *dev = skb_dst(skb)->dev;
-	struct inet6_dev *idev = ip6_dst_idev(skb_dst(skb));
+	struct dst_entry *dst = skb_dst(skb);
+	struct net_device *dev;
+	struct inet6_dev *idev;
+	int ret;
+
+	rcu_read_lock();
+	dev = dst->dev;
+	idev = ip6_dst_idev(dst);
 
 	skb->protocol = htons(ETH_P_IPV6);
 	skb->dev = dev;
 
-	if (unlikely(idev->cnf.disable_ipv6)) {
+	if (unlikely(!idev || READ_ONCE(idev->cnf.disable_ipv6))) {
 		IP6_INC_STATS(net, idev, IPSTATS_MIB_OUTDISCARDS);
 		DROPDUMP_QUEUE_SKB(skb, NET_DROPDUMP_IPSTATS_MIB_OUTDISCARDS3);
+		rcu_read_unlock();
 		kfree_skb(skb);
 		return 0;
 	}
 
-	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
-			    net, sk, skb, NULL, dev,
-			    ip6_finish_output,
-			    !(IP6CB(skb)->flags & IP6SKB_REROUTED));
+	ret = NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
+			   net, sk, skb, NULL, dev,
+			   ip6_finish_output,
+			   !(IP6CB(skb)->flags & IP6SKB_REROUTED));
+	rcu_read_unlock();
+	return ret;
 }
 
 bool ip6_autoflowlabel(struct net *net, const struct ipv6_pinfo *np)
@@ -246,8 +259,10 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 	struct ipv6hdr *hdr;
 	u8  proto = fl6->flowi6_proto;
 	int seg_len = skb->len;
-	int hlimit = -1;
+	int ret, hlimit = -1;
 	u32 mtu;
+
+	rcu_read_lock();
 
 	head_room = sizeof(struct ipv6hdr) + LL_RESERVED_SPACE(dst->dev);
 	if (opt)
@@ -259,7 +274,8 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 			IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
 				      IPSTATS_MIB_OUTDISCARDS);
 			kfree_skb(skb);
-			return -ENOBUFS;
+			ret = -ENOBUFS;
+			goto unlock;
 		}
 		if (skb->sk)
 			skb_set_owner_w(skb2, skb->sk);
@@ -313,15 +329,18 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 		 * skb to its handler for processing
 		 */
 		skb = l3mdev_ip6_out((struct sock *)sk, skb);
-		if (unlikely(!skb))
-			return 0;
+		if (unlikely(!skb)) {
+			ret = 0;
+			goto unlock;
+		}
 
 		/* hooks should never assume socket lock is held.
 		 * we promote our socket to non const
 		 */
-		return NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
-			       net, (struct sock *)sk, skb, NULL, dst->dev,
-			       dst_output);
+		ret = NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
+			      net, (struct sock *)sk, skb, NULL, dst->dev,
+			      dst_output);
+		goto unlock;
 	}
 
 	skb->dev = dst->dev;
@@ -333,7 +352,10 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 	IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)), IPSTATS_MIB_FRAGFAILS);
 	DROPDUMP_QUEUE_SKB(skb, NET_DROPDUMP_IPSTATS_MIB_FRAGFAILS);
 	kfree_skb(skb);
-	return -EMSGSIZE;
+	ret = -EMSGSIZE;
+unlock:
+	rcu_read_unlock();
+	return ret;
 }
 EXPORT_SYMBOL(ip6_xmit);
 
