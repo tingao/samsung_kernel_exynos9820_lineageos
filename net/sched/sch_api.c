@@ -1360,6 +1360,8 @@ replay:
 				q = qdisc_lookup(dev, tcm->tcm_handle);
 				if (!q)
 					goto create_n_graft;
+				if (q->parent != tcm->tcm_parent)
+					return -EINVAL;
 				if (n->nlmsg_flags & NLM_F_EXCL)
 					return -EEXIST;
 				if (tca[TCA_KIND] && nla_strcmp(tca[TCA_KIND], q->ops->id))
@@ -1847,6 +1849,10 @@ static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n,
 			goto out;
 		}
 	}
+
+	/* Prevent creation of traffic classes with classid TC_H_ROOT */
+	if (clid == TC_H_ROOT)
+		return -EINVAL;
 
 	new_cl = cl;
 	err = -EOPNOTSUPP;
