@@ -2541,11 +2541,10 @@ static void tpacket_destruct_skb(struct sk_buff *skb)
 		__u32 ts;
 
 		ph = skb_zcopy_get_nouarg(skb);
+		packet_dec_pending(&po->tx_ring);
 
 		ts = __packet_set_timestamp(po, ph, skb);
 		__packet_set_status(po, ph, TP_STATUS_AVAILABLE | ts);
-
-		packet_dec_pending(&po->tx_ring);
 
 		complete(&po->skb_completion);
 	}
@@ -4384,56 +4383,6 @@ static void free_pg_vec(struct pgv *pg_vec, unsigned int order,
 	kfree(pg_vec);
 }
 
-struct packet_pg_vec_free {
-	struct delayed_work work;
-	struct sock *sk;
-	struct pgv *pg_vec;
-	unsigned int order;
-	unsigned int len;
-};
-
-static void packet_free_pg_vec_work(struct work_struct *work)
-{
-	struct packet_pg_vec_free *fw =
-		container_of(to_delayed_work(work), struct packet_pg_vec_free, work);
-
-	if (sk_wmem_alloc_get(fw->sk)) {
-		queue_delayed_work(system_long_wq, &fw->work, 1);
-		return;
-	}
-
-	free_pg_vec(fw->pg_vec, fw->order, fw->len);
-	sock_put(fw->sk);
-	kfree(fw);
-}
-
-static void packet_free_tx_ring(struct sock *sk, struct pgv *pg_vec,
-				unsigned int order, unsigned int len)
-{
-	struct packet_pg_vec_free *fw;
-
-	/* TX ring buffers can still be referenced by skbs queued for
-	 * transmit.  Delay the vmalloc/free until the socket wmem drains
-	 * instead of freeing memory that a late skb destructor touches.
-	 */
-	if (!sk_wmem_alloc_get(sk)) {
-		free_pg_vec(pg_vec, order, len);
-		return;
-	}
-
-	fw = kmalloc(sizeof(*fw), GFP_KERNEL);
-	if (!fw)
-		return;		/* leak rather than risk a use-after-free */
-
-	INIT_DELAYED_WORK(&fw->work, packet_free_pg_vec_work);
-	fw->sk = sk;
-	sock_hold(sk);
-	fw->pg_vec = pg_vec;
-	fw->order = order;
-	fw->len = len;
-	queue_delayed_work(system_long_wq, &fw->work, 1);
-}
-
 static char *alloc_one_pg_vec_page(unsigned long order)
 {
 	char *buffer;
@@ -4645,11 +4594,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 out_free_pg_vec:
 	if (pg_vec) {
 		bitmap_free(rx_owner_map);
-		if (tx_ring && closing)
-			packet_free_tx_ring(sk, pg_vec, order,
-					    req->tp_block_nr);
-		else
-			free_pg_vec(pg_vec, order, req->tp_block_nr);
+		free_pg_vec(pg_vec, order, req->tp_block_nr);
 	}
 out:
 	return err;
